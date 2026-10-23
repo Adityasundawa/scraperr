@@ -208,12 +208,22 @@ const progress = () => {
   console.log(`  ${done + failed.length}/${todo.length} | ok ${done} gagal ${failed.length} | ${gb(bytes)} | ${(bytes / 2 ** 20 / sec).toFixed(1)} MB/s`);
 };
 console.log(`\nmulai menyalin ${todo.length} object dengan ${conc} pekerja (progres tiap 10 detik)...`);
+await fs.writeFile('migrate-failed.txt', '');
 const tick = setInterval(progress, 10000);
+let streak = 0, stopped = false; // gagal beruntun: kalau banyak, hampir pasti masalah akun/kuota/jaringan, bukan file tertentu
 await Promise.all(Array.from({ length: conc }, async () => {
   while (next < todo.length) {
     const key = todo[next++];
-    try { await retry(() => copyOne(key, src.get(key)), key, 3); done++; bytes += src.get(key).size; }
-    catch (e) { failed.push(`${key}\t${e.message}`); }
+    try { await retry(() => copyOne(key, src.get(key)), key, 3); done++; bytes += src.get(key).size; streak = 0; }
+    catch (e) {
+      failed.push(`${key}\t${e.message}`); streak++;
+      await fs.appendFile('migrate-failed.txt', `${key}\t${e.message}\n`);
+      if (failed.length <= 5) console.log(`  GAGAL ${key}: ${e.message}`);
+      if (streak >= 25) {
+        next = todo.length; // hentikan semua pekerja
+        if (!stopped) { stopped = true; console.log(`\nBERHENTI: ${streak} gagal beruntun. Kemungkinan masalah akun/kuota/izin B2, key, atau jaringan, bukan file tertentu.\n  Pesan terakhir: ${e.message}`); }
+      }
+    }
   }
 }));
 clearInterval(tick);
