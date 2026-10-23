@@ -1,0 +1,19 @@
+{
+  "name": "dewa-drama-scraper",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "scrape": "node --env-file=.env scrape.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1154.0",
+    "mysql2": "^3.24.6",
+    "playwright": "^1.64.1"
+  }
+}

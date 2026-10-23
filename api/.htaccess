@@ -1,0 +1,4 @@
+# jangan sampai .env bisa diunduh lewat browser (Apache / Laragon)
+<Files ".env">
+    Require all denied
+</Files>

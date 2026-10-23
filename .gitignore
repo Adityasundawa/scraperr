@@ -1,0 +1,8 @@
+node_modules
+.profile
+out
+.env
+upload.log
+result.json
+*.zip
+.claude
