@@ -2,6 +2,10 @@
 //   node --env-file=.env migrate.mjs              dry-run (default): bandingkan R2 vs B2, tidak ada yang disalin
 //   node --env-file=.env migrate.mjs --run        salin yang belum ada di B2 (lalu verifikasi otomatis)
 //   node --env-file=.env migrate.mjs --verify     cek saja: ukuran + ETag(MD5) R2 vs B2 cocok semua?
+//   node --env-file=.env migrate.mjs --db         rencana ubah database pusat (lewat API): link R2 -> URL baru di B2 (tidak menulis)
+//   node --env-file=.env migrate.mjs --db --run   ubah database pusat lewat API. Dipanggil otomatis di akhir --run kalau NEW_PUBLIC_URL diisi
+//   Database diubah hanya untuk object yang SUDAH ada di B2; yang belum dibiarkan. Aman diulang.
+//   env tambahan: API_URL, NEW_PUBLIC_URL (URL publik baru untuk object di B2), R2_PUBLIC_URL (URL lama; atau OLD_PUBLIC_URL)
 // opsi: --prefix=series/   batasi ke satu folder     --c=8   jumlah unduh/unggah paralel (default 8)
 //       --overwrite        timpa object B2 yang ukurannya BEDA (default: dilewati dan dilaporkan sebagai bentrok)
 // Tidak pernah menghapus apa pun, baik di R2 maupun di B2. Aman diulang (yang sudah sama dilewati).
@@ -21,6 +25,10 @@ const opt = (k, d) => args.find(a => a.startsWith(`--${k}=`))?.split('=')[1] ?? 
 const doRun = args.includes('--run'), onlyVerify = args.includes('--verify'), overwrite = args.includes('--overwrite');
 const prefix = opt('prefix', ''), conc = +opt('c', 8);
 const R2_BUCKET = env.R2_BUCKET || 'tdrama1', B2_BUCKET = env.B2_BUCKET;
+const dbOnly = args.includes('--db');
+const API = (env.API_URL || '').replace(/\/$/, '');
+const OLD_BASE = (env.OLD_PUBLIC_URL || env.R2_PUBLIC_URL || '').replace(/\/$/, '');
+const NEW_BASE = (env.NEW_PUBLIC_URL || '').replace(/\/$/, '');
 const B2_ENDPOINT = env.B2_ENDPOINT || 'https://s3.us-west-004.backblazeb2.com';
 for (const k of ['R2_ACCOUNT', 'B2_KEY_ID', 'B2_APP_KEY', 'B2_BUCKET']) if (!env[k]) throw new Error(`set ${k} di .env dulu`);
 
@@ -55,9 +63,17 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const retry = async (fn, label, tries = 4) => {
   for (let t = 1; ; t++) {
     try { return await fn(); }
-    catch (e) { if (t >= tries) throw new Error(`${label}: ${e.message}`); await sleep(1500 * t); }
+    catch (e) { if (e.fatal || t >= tries) throw new Error(`${label}: ${e.message}`); await sleep(1500 * t); }
   }
 };
+// API PHP (sama seperti scrape.mjs): GET kalau tanpa body, POST JSON kalau ada body. 4xx = salah data, jangan diulang.
+const api = (path, body) => retry(async () => {
+  const r = await fetch(`${API}/${path}`, { ...(body && { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+    signal: AbortSignal.timeout(30000) });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) throw Object.assign(new Error(`API ${r.status}: ${j?.error ?? 'respons bukan JSON'}`), { fatal: r.status < 500 });
+  return j;
+}, path.split('?')[0]);
 const gb = n => (n / 2 ** 30).toFixed(2) + ' GB';
 const clean = s => (s || '').replace(/"/g, '');
 
@@ -138,7 +154,47 @@ async function verify() {
   return !missing.length && !diff.length;
 }
 
+// Ubah database pusat lewat API: link yang menunjuk ke URL lama (R2) diganti ke URL baru (B2), hanya untuk object yang sudah ada di B2.
+// Yang diubah: series.thumbnail_url, series.meta_url, episodes.url (status ok). Kolom lain, termasuk status, tidak berubah.
+async function updateDb(apply) {
+  if (!API || !OLD_BASE || !NEW_BASE) throw new Error('set API_URL, R2_PUBLIC_URL (URL lama), dan NEW_PUBLIC_URL (URL baru di B2) di .env');
+  if (NEW_BASE === OLD_BASE) { console.log('\nDB: URL lama dan baru sama, tidak ada yang perlu diubah.'); return; }
+  console.log(`\nDB (${apply ? 'UBAH' : 'rencana saja'}): ${OLD_BASE} -> ${NEW_BASE}`);
+  const inB2 = await listAll(b2, B2_BUCKET, '');
+  const rewrite = u => { // null = bukan link lama, atau objeknya belum ada di B2 (dibiarkan)
+    if (!u || !u.startsWith(OLD_BASE + '/')) return null;
+    return inB2.has(decodeURIComponent(u.slice(OLD_BASE.length + 1))) ? NEW_BASE + u.slice(OLD_BASE.length) : null;
+  };
+  const pool = async (items, fn) => { let i = 0; await Promise.all(Array.from({ length: 4 }, async () => { while (i < items.length) await fn(items[i++]); })); };
+
+  const series = new Map();
+  for (let off = 0; ; off += 200) { const page = await api(`series.php?limit=200&offset=${off}`); page.forEach(s => series.set(s.id, s)); if (page.length < 200) break; }
+  const sUp = [];
+  for (const s of series.values()) {
+    const patch = {}, t = rewrite(s.thumbnail_url), m = rewrite(s.meta_url);
+    if (t) patch.thumbnail_url = t;
+    if (m) patch.meta_url = m;
+    if (t || m) sUp.push({ id: s.id, title: s.title, folder: s.folder, ...patch }); // id+title+folder wajib di API; nilainya tetap sama
+  }
+  const state = await api('state.php');
+  const eUp = []; let left = 0;
+  await pool(state.series.filter(s => s.ok > 0), async s => {
+    for (const e of await api(`episodes.php?series_id=${s.id}`)) {
+      if (e.status !== 'ok') continue;
+      const u = rewrite(e.url);
+      if (u) eUp.push({ series_id: e.series_id, episode_number: e.episode_number, status: e.status, url: u }); else left++;
+    }
+  });
+  console.log(`  series diubah: ${sUp.length}/${series.size} | episode diubah: ${eUp.length} | episode ok dibiarkan (belum ada di B2 / bukan link lama): ${left}`);
+  for (const x of eUp.slice(0, 2)) console.log(`    contoh: ${x.series_id} ep${x.episode_number} -> ${x.url}`);
+  if (!apply) { console.log('  (belum ada yang ditulis. Jalankan dengan --db --run untuk mengubah database lewat API.)'); return; }
+  await pool(sUp, s => api('series.php', s));
+  for (let i = 0; i < eUp.length; i += 200) await api('episodes.php', eUp.slice(i, i + 200)); // episodes.php menerima array
+  console.log(`  SELESAI: ${sUp.length} series dan ${eUp.length} episode di database pusat sekarang menunjuk ke ${NEW_BASE}`);
+}
+
 if (onlyVerify) process.exit((await verify()) ? 0 : 1);
+if (dbOnly) { await updateDb(doRun); process.exit(0); }
 
 const plan = compare();
 report(plan);
@@ -167,6 +223,10 @@ if (failed.length) {
   console.log(`\n${failed.length} object gagal, daftar di migrate-failed.txt. Jalankan ulang --run untuk mencoba lagi (yang sudah sama dilewati).`);
 }
 const ok = await verify();
+if (ok && !failed.length) {
+  if (NEW_BASE) await updateDb(true).catch(e => console.log('\nDB: gagal diubah:', e.message, '(jalankan nanti: --db --run)'));
+  else console.log('\nDB: NEW_PUBLIC_URL belum diisi, link di database pusat belum diubah (isi di .env lalu jalankan --db --run).');
+}
 console.log(ok && !failed.length
   ? '\nSELESAI: semua cocok. Tidak ada yang dihapus di R2. Setelah cek manual, nonaktifkan Application Key B2 read-write ini.'
   : '\nBELUM TUNTAS: perbaiki yang gagal (jalankan ulang --run) sebelum menganggap migrasi selesai.');
