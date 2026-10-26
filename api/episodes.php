@@ -11,12 +11,16 @@ if ($method === 'GET') {
         $st = $db->prepare("SELECT r2_key, url, size_bytes FROM episodes WHERE source_file = ? AND status = 'ok'
             AND NOT (series_id = ? AND episode_number = ?) LIMIT 1");
         $st->execute([$_GET['source_file'], $_GET['series_id'] ?? '', (int)($_GET['episode_number'] ?? -1)]);
-        out($st->fetch() ?: null);
+        $row = $st->fetch();
+        if ($row) $row['url'] = signMedia($row['url']);
+        out($row ?: null);
     }
     if (empty($_GET['series_id'])) out(['error' => 'series_id wajib'], 400);
     $st = $db->prepare('SELECT * FROM episodes WHERE series_id = ? ORDER BY episode_number');
     $st->execute([$_GET['series_id']]);
-    out($st->fetchAll());
+    $rows = $st->fetchAll();
+    foreach ($rows as &$r) if ($r['status'] === 'ok') $r['url'] = signMedia($r['url']);
+    out($rows);
 }
 
 if ($method === 'POST') {

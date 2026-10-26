@@ -39,6 +39,21 @@ try {
     out(['error' => 'DB tidak bisa dibuka: ' . $ex->getMessage()], 500);
 }
 
+// Tanda tangan URL media (host media.kilasdrama.online saja; host lain dibiarkan apa adanya).
+// Dipanggil tiap kali link dikirim ke pemutar -- JANGAN disimpan ke DB/cache lama (TTL default 2 jam).
+function signMedia(?string $url, int $ttl = 7200): ?string {
+    if (!$url) return $url;
+    $host = parse_url($url, PHP_URL_HOST);
+    if ($host !== 'media.kilasdrama.online') return $url;
+    $secret = getenv('MEDIA_SIGNING_SECRET');
+    if (!$secret) return $url; // belum diisi di .env -> jangan 500, biarkan link polos (akan 403 di gateway)
+    $path = parse_url($url, PHP_URL_PATH); // sudah ter-encode di DB, jangan di-decode
+    $exp = time() + $ttl;
+    $raw = hash_hmac('sha256', "$path.$exp", $secret, true);
+    $sig = rtrim(strtr(base64_encode($raw), '+/', '-_'), '=');
+    return "$url?exp=$exp&sig=$sig";
+}
+
 function body(): array {
     $j = json_decode(file_get_contents('php://input'), true);
     if (!is_array($j)) out(['error' => 'body harus JSON'], 400);
